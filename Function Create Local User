@@ -1,0 +1,173 @@
+<#
+.SYNOPSIS
+Creates local user account (needs local admin rights), creates scheduled task on a nightly schedule under the service accout name.
+Finally, creates an FTP PS1 file for uploading files to ftp which is used in the scheduled task.
+
+.DESCRIPTION
+
+-Creates local account, sets description "Service Account", accepts and sets user inputted password, 
+
+-Adds account to "users" group, sets password never expires, user cannot change password
+
+-Once account is created, a scheduled task is then created and set to run another script and scheduled for 12 am daily. 
+
+-A command was added to enable this script to be run on remote machines as well locally.   
+
+-Error checking -- checks for already existing account, if no account exists, proceeds with account creation.
+
+If account does exists, the script stops and throws error.
+
+
+.EXAMPLE
+
+First, save the script locally, then open an elevated powershell window.
+  
+You must use use 'Dot Sourcing' to call on the script. 
+
+This is done by using a period and space before the path.  example -- . c:\scripts\SVC_Account_Create.ps1
+
+------------- Local Use --------------
+To run the script locally, use the following syntax:
+
+. c:\scripts\SVC_Local_Accoun.ps1; Add-LocalSVC -Username (type username) 
+
+(type the path of the script using dot sourcing followed by a semi colon. 
+
+User input to type username you want to use without the parenthesis, password will auto prompt next)
+
+------------ Remote Use -----------
+
+To run the script on remote computers, use the following syntax:
+
+. c:\scripts\SVC_Account_Create.ps1; Add-LocalSVC -Username (type username) -computername (type remote computername) -credential $credential 
+
+(same as above for calling the script and entering username and password for the new local account.
+
+For remote, you will need to add -computername and -credentials which will be the remote computer name followed by admin credentials 
+
+for -credential $credential will prompt for admin username and password
+
+Another key here is that you can add MULTIPLE computers to -computername parameter so that you can perform this on as many computers as you need at once. 
+ 
+NO need to run multiple times
+
+
+.NOTES
+
+Name: SVC_Local_Account.ps1
+
+Author: Daniel Lourenco 
+
+
+#>
+
+#Run As Administrator
+
+function Add-LocalSVC {
+
+param (
+[string[]]
+    $ComputerName,
+
+  [Parameter()]
+    [ValidateNotNull()]
+    [System.Management.Automation.PSCredential]
+    [System.Management.Automation.Credential()]
+    $Credential = [System.Management.Automation.PSCredential]::Empty,
+
+[parameter(Mandatory=$true)]
+[string] $Username,
+[Security.SecureString][parameter(Mandatory=$true)]$Password
+
+)
+
+#edit description below
+$Description = "Service Account"
+
+#code that checks if account is created first, if not, will create the new account.  If username is being used, script will stop and throw an error
+
+  $code = {
+
+try{
+
+ If (!(get-localuser -name $username -erroraction ignore)){ 
+new-localuser -name $username -description $description -password $password -PasswordNeverExpires -UserMayNotChangePassword -ErrorAction stop | out-host
+$success=$?
+Add-LocalGroupMember -Group "Users" -Member $username
+}else{cls;"$Username account already Exists";write-host ''}
+
+}catch {
+$ErrorMessage = $_.Exception.Message
+    if ($ErrorMessage  -like '*Access*Denied*') {write-host ''; write-warning "$env:username does not have suffcient privledges to create account";write-host ''}
+       elseif ($errormessage -like '*password*'){write-host '';write-warning 'Password does not meet the password policy';write-host '' }
+       }   
+
+#Creates the scheduled task if above account creation was successful
+
+try {
+if($success){
+$actions   = (New-ScheduledTaskAction -Execute "C:\scripts\FTP.ps1" )
+$trigger   = New-ScheduledTaskTrigger -Daily -At 12AM
+$principal = New-ScheduledTaskPrincipal -userID "$($env:USERDOMAIN)\$USERNAME" -RunLevel Highest -LogonType serviceaccount
+$settings  = New-ScheduledTaskSettingsSet -RunOnlyIfNetworkAvailable -WakeToRun
+$task      = New-ScheduledTask -Action $actions -Principal $principal -Trigger $trigger -Settings $settings 
+Register-ScheduledTask 'FTP' -InputObject $task -ErrorAction stop
+$successftp=$?
+}
+if ($successftp) {write-host'';write-host "Scheduled Task Was Created" -ForegroundColor white -BackgroundColor black;write-host ''}
+else{write-host "No Scheduled Task Created" -ForegroundColor white -BackgroundColor black;write-host''}
+}catch {
+$ErrorMessagetask = $_.Exception.Message
+if ($ErrorMessagetask  -like '*file*already*exists*'){write-host'';write-warning 'Scheduled Task Name already exists';write-host''}
+}
+
+#create FTP PS1 file
+if ($successftp) {
+
+$outfile='C:\scripts\ftp.ps1'
+
+# Set the credentials
+"`$Credential = New-Object System.Management.Automation.PSCredential ('$username', '$Password')" | add-content $outfile
+'' | add-content $outfile
+
+"# Set local file path, SFTP path, and the backup location path which I assume is an SMB path" | add-content $outfile
+"`$FilePath = 'C:\temp\test.txt'" | add-content $outfile
+"`$SftpPath = '/'" | add-content $outfile
+"`$SmbPath = '\\filer01\Backup'" | add-content $outfile
+'' | add-content $outfile
+
+"# Set the IP of the SFTP server" | add-content $outfile
+"`$SftpIp = 'test.rebex.net'" | add-content $outfile
+'' | add-content $outfile
+
+"# Load the Posh-SSH module" | add-content $outfile
+"Import-Module Posh-SSH" | add-content $outfile
+'' | add-content $outfile
+
+"# Establish the SFTP connection" | add-content $outfile
+"`$ThisSession = New-SFTPSession -ComputerName `$SftpIp -Credential `$Credential" | add-content $outfile
+'' | add-content $outfile
+
+"# Upload the file to the SFTP path" | add-content $outfile
+"Set-SFTPitem -SessionId ($ThisSession).SessionId -path `$FilePath -Destination `$SftpPath" |add-content $outfile
+'' | add-content $outfile
+
+"# Disconnect all SFTP Sessions" | add-content $outfile
+"Get-SFTPSession | % { Remove-SFTPSession -SessionId (`$_.SessionId) }" |add-content $outfile
+'' | add-content $outfile
+
+"# Copy the file to the SMB location" | add-content $outfile
+"Copy-Item -Path `$FilePath -Destination $SmbPath" |add-content $outfile
+if (test-path $outfile -ErrorAction ignore){write-host'';write-host "FTP script was created --- $outfile " -ForegroundColor White -BackgroundColor Black;write-host ''}
+}
+else{write-host'';write-host 'FTP script NOT Created' -ForegroundColor white -BackgroundColor black;write-host ''}
+
+
+}
+
+#Code that enables this script to be run on remote machines using -computername and -credential parameters
+Invoke-Command -ScriptBlock $code -ArgumentList $Description,$password,$username,$outfile
+
+}
+
+
